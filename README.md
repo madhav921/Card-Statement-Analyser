@@ -40,7 +40,7 @@ StmtForge includes a **Streamlit analytics dashboard** with interactive charts, 
 
 <div align="center">
 
-<img src="images/dashboard.png" alt="StmtForge Dashboard — monthly spend trend, category breakdown, top merchants, bank-wise breakdown" width="90%">
+<img src="assets/images/dashboard.png" alt="StmtForge Dashboard — monthly spend trend, category breakdown, top merchants, bank-wise breakdown" width="90%">
 
 *Analytics: total spend, monthly trends, category breakdown, top merchants, bank & card comparison, daily heatmap, drill-downs*
 
@@ -129,6 +129,14 @@ stmtforge dashboard
 ```
 
 **Manual PDF import:** Drop PDFs into `data/raw_pdfs/<bank>/` and run `stmtforge run --local`. No Gmail setup needed.
+
+> **Where do my PDFs go?**  
+> Place your password-protected statement PDFs inside `data/raw_pdfs/<bank>/` — for example:  
+> - `data/raw_pdfs/hdfc/5268XXXXXXXXXX38_19-11-2025.pdf`  
+> - `data/raw_pdfs/sbi/7411XXXXXXXXXXXX_15062024.pdf`  
+> - `data/raw_pdfs/idfc/601000XXXXXXXX_24112025_110414520.pdf`  
+>  
+> The `<bank>` folder name must match one of the supported bank keys: `hdfc`, `sbi`, `icici`, `axis`, `kotak`, `yes`, `csb`, `federal`, `idfc`. StmtForge will auto-unlock and parse all PDFs found recursively. You can also sub-organise by month (`data/raw_pdfs/hdfc/2025_11/`) — both flat and nested layouts are supported.
 
 ---
 

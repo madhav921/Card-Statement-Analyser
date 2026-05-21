@@ -90,9 +90,30 @@ class HybridPipeline:
 
         # ── Step 1: Try deterministic parser ─────────────────────
         det_df = pd.DataFrame()
+        det_summary = None
         if self.use_deterministic:
-            det_df = self._try_deterministic(str(pdf_path), bank)
+            det_df, det_summary = self._try_deterministic(str(pdf_path), bank)
 
+        # Trust the deterministic parser for any known bank when it returns at
+        # least 1 transaction.  The old threshold of >= 3 caused statements
+        # with genuinely few transactions (e.g. a 2-transaction month) to fall
+        # through to the LLM, which then hallucinated example-prompt data.
+        if not det_df.empty and bank != "unknown":
+            logger.info(
+                f"Deterministic parser succeeded: {len(det_df)} transactions"
+            )
+            return self._finalize(
+                det_df, bank, fhash, filename, card_name, email_date,
+                method="deterministic",
+                confidence=0.95,
+                raw_text="",
+                llm_output="",
+                statement_summary=det_summary,
+                **meta,
+            )
+
+        # For unknown bank or truly zero-result parsers, fall through to LLM
+        # but still keep det_df around as a fallback.
         if not det_df.empty and len(det_df) >= 3:
             logger.info(
                 f"Deterministic parser succeeded: {len(det_df)} transactions"
@@ -103,6 +124,7 @@ class HybridPipeline:
                 confidence=0.95,
                 raw_text="",
                 llm_output="",
+                statement_summary=det_summary,
                 **meta,
             )
 
@@ -214,15 +236,24 @@ class HybridPipeline:
             **meta,
         )
 
-    def _try_deterministic(self, pdf_path: str, bank: str) -> pd.DataFrame:
-        """Try the bank-specific deterministic parser."""
+    def _try_deterministic(self, pdf_path: str, bank: str) -> tuple[pd.DataFrame, dict | None]:
+        """Try the bank-specific deterministic parser.
+
+        Returns (df, statement_summary) where statement_summary may be None.
+        """
         try:
             parser = get_parser(bank)
             df = parser.parse(pdf_path)
-            return df if df is not None else pd.DataFrame()
+            summary = None
+            if hasattr(parser, "get_statement_summary"):
+                try:
+                    summary = parser.get_statement_summary(pdf_path)
+                except Exception as e:
+                    logger.debug(f"Statement summary extraction failed for {bank}: {e}")
+            return (df if df is not None else pd.DataFrame()), summary
         except Exception as e:
             logger.debug(f"Deterministic parser failed for {bank}: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), None
 
     def _transactions_to_df(self, transactions: list[dict],
                             bank: str) -> pd.DataFrame:
@@ -255,6 +286,7 @@ class HybridPipeline:
                   filename: str, card_name: str, email_date: str,
                   method: str, confidence: float,
                   raw_text: str = "", llm_output: str = "",
+                  statement_summary: dict = None,
                   **meta) -> dict:
         """
         Categorize, detect card info, store to DB, log extraction.
@@ -299,6 +331,46 @@ class HybridPipeline:
 
         # Update statement status
         self.db.update_statement_status(fhash, "completed", len(df))
+
+        # Derive statement period from min/max transaction dates
+        period_start = None
+        period_end = None
+        if not df.empty and "date" in df.columns:
+            dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+            if not dates.empty:
+                period_start = dates.min().strftime("%Y-%m-%d")
+                period_end = dates.max().strftime("%Y-%m-%d")
+
+        # Backfill card_name and period dates into statements_metadata
+        self.db.update_statement_metadata(
+            fhash,
+            card_name=card_name,
+            statement_period_start=period_start,
+            statement_period_end=period_end,
+        )
+
+        # Store financial summary if available (e.g. from CSB parser)
+        if statement_summary and statement_summary.get("total_amount_due") is not None:
+            stmt_credits = (
+                (statement_summary.get("repayments") or 0)
+                + (statement_summary.get("refunds_and_reversals") or 0)
+                + (statement_summary.get("waivers") or 0)
+            )
+            self.db.update_statement_summary(
+                fhash,
+                total_amount_due=statement_summary.get("total_amount_due"),
+                total_spends=statement_summary.get("spends"),
+                total_credits=stmt_credits or None,
+            )
+        elif not df.empty:
+            # Derive spends and credits directly from transactions
+            txn_spends = df[df["type"] == "debit"]["amount"].sum()
+            txn_credits = df[df["type"] == "credit"]["amount"].sum()
+            self.db.update_statement_summary(
+                fhash,
+                total_spends=float(txn_spends) if txn_spends > 0 else None,
+                total_credits=float(txn_credits) if txn_credits > 0 else None,
+            )
 
         # Log extraction
         self._log_extraction(
@@ -401,11 +473,13 @@ class HybridPipeline:
         for pdf_path in pdfs:
             fhash = file_hash(str(pdf_path))
 
-            # Detect bank from subfolder structure within the given folder
+            # Detect bank from subfolder structure within the given folder.
+            # Only apply subfolder-based detection when the caller did NOT
+            # pass an explicit bank (i.e. bank == "unknown").
             try:
                 rel = pdf_path.relative_to(folder)
                 parts = rel.parts
-                detected_bank = parts[0] if len(parts) > 1 else bank
+                detected_bank = (parts[0] if len(parts) > 1 else bank) if bank == "unknown" else bank
             except ValueError:
                 detected_bank = bank
 

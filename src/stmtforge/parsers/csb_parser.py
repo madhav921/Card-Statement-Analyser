@@ -7,6 +7,7 @@ Handles:
 
 import re
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -14,6 +15,39 @@ from stmtforge.parsers.base_parser import BaseParser, parse_date, parse_amount, 
 from stmtforge.utils.logging_config import get_logger
 
 logger = get_logger("parsers.csb")
+
+# ─── Statement-summary regexes (work on multi-line page text) ─────────────────
+# Format 1 (older): labeled fields, value may be on same or next line
+_SUMMARY_TOTAL_DUE_RE = re.compile(
+    r"Total amount due[^\n]*\n?\s*Rs\.\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+_SUMMARY_SPENDS_RE = re.compile(
+    r"Spends\s+Rs\.\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+_SUMMARY_REPAYMENTS_RE = re.compile(
+    r"Repayments\s*\n?\s*Rs\.\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+_SUMMARY_REFUNDS_RE = re.compile(
+    r"Refunds and reversals\s*\n?\s*Rs\.\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+_SUMMARY_WAIVERS_RE = re.compile(
+    r"Waivers\s*\n?\s*Rs\.\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+_SUMMARY_PREV_BALANCE_RE = re.compile(
+    r"Previous balance[^\n]*Rs\.\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+# Format 2 (newer): "Rs. AMOUNT  DD Mon YYYY" — total due with payment date
+_BILL_AMOUNT_WITH_DATE_RE = re.compile(
+    r"Rs\.\s*([\d,]+(?:\.\d{2})?)\s+\d{2}\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}",
+    re.IGNORECASE,
+)
 
 
 class CSBParser(BaseParser):
@@ -147,7 +181,7 @@ class CSBParser(BaseParser):
                 self.TRANSACTION_RE,
                 self.TRANSACTION_RE2,
             ]:
-                match = pattern.search(line)
+                match = pattern.match(line)
                 if match:
                     groups = match.groups()
                     if pattern in (self.TRANSACTION_RE_EDGE, self.TRANSACTION_RE_EDGE_SHORT_YEAR):
@@ -177,3 +211,61 @@ class CSBParser(BaseParser):
             from collections import Counter
             return int(Counter(years).most_common(1)[0][0])
         return 2024
+
+    # ── Statement summary ────────────────────────────────────────
+
+    def _parse_statement_summary(self, text: str) -> dict:
+        """Extract key financial totals from the statement summary section.
+
+        Supports two formats:
+        - Older (labeled): 'Spends Rs. 17,053.65' / 'Total amount due\\nRs. 11,198.55'
+        - Newer (positional): 'Rs. 12,589  01 May 2026' for total due with payment date
+
+        Returns a dict with float values (None where not found).
+        """
+
+        def _parse_rs(m) -> Optional[float]:
+            if not m:
+                return None
+            return parse_amount(m.group(1))
+
+        result: dict = {
+            "total_amount_due": None,
+            "spends": None,
+            "repayments": None,
+            "refunds_and_reversals": None,
+            "waivers": None,
+            "previous_balance": None,
+        }
+
+        # Try labeled format first (Format 1)
+        result["total_amount_due"] = _parse_rs(_SUMMARY_TOTAL_DUE_RE.search(text))
+        result["spends"] = _parse_rs(_SUMMARY_SPENDS_RE.search(text))
+        result["repayments"] = _parse_rs(_SUMMARY_REPAYMENTS_RE.search(text))
+        result["refunds_and_reversals"] = _parse_rs(_SUMMARY_REFUNDS_RE.search(text))
+        result["waivers"] = _parse_rs(_SUMMARY_WAIVERS_RE.search(text))
+        result["previous_balance"] = _parse_rs(_SUMMARY_PREV_BALANCE_RE.search(text))
+
+        # Fallback for newer format: first "Rs. AMOUNT  DD Mon YYYY" is total due
+        if result["total_amount_due"] is None:
+            m = _BILL_AMOUNT_WITH_DATE_RE.search(text)
+            if m:
+                result["total_amount_due"] = parse_amount(m.group(1))
+
+        return result
+
+    def get_statement_summary(self, pdf_path: str | Path) -> Optional[dict]:
+        """Public method: parse and return statement financial summary from PDF."""
+        try:
+            full_text = self.extractor.extract_text(Path(pdf_path))
+            summary = self._parse_statement_summary(full_text)
+            if summary.get("total_amount_due") is not None:
+                logger.info(
+                    f"CSB statement summary for {Path(pdf_path).name}: "
+                    f"total_due={summary['total_amount_due']}, "
+                    f"spends={summary['spends']}, repayments={summary['repayments']}"
+                )
+            return summary
+        except Exception as e:
+            logger.warning(f"Could not parse statement summary for {pdf_path}: {e}")
+            return None

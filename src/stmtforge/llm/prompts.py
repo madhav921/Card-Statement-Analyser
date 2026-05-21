@@ -19,11 +19,11 @@ Rules:
 
 Return ONLY a valid JSON array. No explanations, no markdown, no extra text.
 
-Example output:
+Example output (these are FICTIONAL placeholder values — do NOT copy them):
 [
-  {"date": "15/01/2024", "description": "AMAZON PAY INDIA", "amount": 499.00, "type": "debit"},
-  {"date": "16/01/2024", "description": "SWIGGY", "amount": 235.50, "type": "debit"},
-  {"date": "18/01/2024", "description": "PAYMENT RECEIVED - THANK YOU", "amount": 5000.00, "type": "credit"}
+  {"date": "01/01/2001", "description": "EXAMPLE MERCHANT A", "amount": 100.00, "type": "debit"},
+  {"date": "02/01/2001", "description": "EXAMPLE MERCHANT B", "amount": 50.00, "type": "debit"},
+  {"date": "03/01/2001", "description": "EXAMPLE PAYMENT", "amount": 200.00, "type": "credit"}
 ]
 
 Statement text:

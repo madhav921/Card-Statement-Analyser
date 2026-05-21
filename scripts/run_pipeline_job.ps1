@@ -3,14 +3,27 @@
 # Called by Windows Task Scheduler (CCAnalyser-Pipeline-Daily-9PM)
 # ============================================================
 
-$ProjectRoot = "C:\Users\madha\Documents\CCAnalyser"
+# Resolve project root relative to this script's location (works with Task Scheduler)
+$ScriptDir   = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ProjectRoot = Split-Path -Parent $ScriptDir
 $Venv        = "$ProjectRoot\.venv\Scripts"
 $LogDir      = "$ProjectRoot\data\logs"
-$LogFile     = "$LogDir\scheduler_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# Move to project root immediately so relative paths work even if Task Scheduler
+# starts the process in a different working directory.
+Set-Location $ProjectRoot
+
+# Brief startup delay — gives the system time to be network-ready when the
+# machine wakes from sleep and triggers the task at the same moment.
+Start-Sleep -Seconds 15
+
+$LogFile = "$LogDir\scheduler_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 # Force UTF-8 throughout so ₹ and other non-ASCII chars don't crash log capture
 $env:PYTHONIOENCODING = "utf-8"
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { <# non-interactive context — safe to ignore #> }
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 
 # Ensure log dir exists

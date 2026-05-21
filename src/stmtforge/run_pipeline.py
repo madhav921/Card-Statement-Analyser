@@ -37,9 +37,10 @@ from stmtforge.utils.run_logger import RunLogger
 from stmtforge.utils.privacy_logging import PrivacyEventLogger
 
 
-# Filename→bank mapping for "unknown" folder PDFs
+# Filename→bank mapping for PDFs in the "unknown" folder.
+# Patterns here are generic; account-number-specific hints belong in config.yaml
+# (parsers.filename_to_bank) which is gitignored and user-local.
 _FILENAME_BANK_HINTS = [
-    (re.compile(r"^60100002192354_"), "idfc_first"),
     (re.compile(r"^CreditCard_Statement_"), "federal"),
     (re.compile(r"^Credit Card Statement\.pdf$", re.IGNORECASE), "axis"),
     (re.compile(r"^Scapia_"), "federal"),
@@ -215,7 +216,6 @@ def backfill_unknown_bank_rows(db: Database) -> dict:
         ("Statement.pdf", "csb", "Edge"),
         ("Credit Card Statement.pdf", "axis", "Neo Rupay"),
         ("CreditCard_Statement_%", "federal", "Signet"),
-        ("60100002192354_%", "idfc_first", "Select"),
     ]
 
     tx_updated = 0
@@ -250,13 +250,22 @@ def cleanup_irrelevant_records(db: Database) -> dict:
 
     with db._get_conn() as conn:
         rows = conn.execute(
-            "SELECT file_hash, filename, bank FROM statements_metadata"
+            "SELECT file_hash, filename, bank, original_path FROM statements_metadata"
         ).fetchall()
+
+        def _effective_filename(row) -> str | None:
+            """Return filename, falling back to basename of original_path."""
+            if row["filename"]:
+                return row["filename"]
+            if row["original_path"]:
+                from pathlib import Path as _Path
+                return _Path(row["original_path"]).name
+            return None
 
         irrelevant_hashes = [
             row["file_hash"]
             for row in rows
-            if row["filename"] and is_irrelevant_filename(row["filename"], row["bank"] or "unknown")
+            if (fn := _effective_filename(row)) and is_irrelevant_filename(fn, row["bank"] or "unknown")
         ]
 
         if not irrelevant_hashes:
@@ -333,6 +342,22 @@ def cleanup_csb_edge_artifacts(db: Database) -> dict:
         )
 
     return {"promoted_to_credit": promoted_to_credit, "deleted_noise": deleted_noise}
+
+
+def _backfill_statement_metadata(db: Database, logger=None) -> None:
+    """Backfill card_name, period dates, and financial totals from existing transactions."""
+    if logger is None:
+        logger = get_logger("pipeline.backfill_meta")
+    try:
+        result = db.backfill_statement_metadata()
+        if result["metadata_updated"] or result["summary_updated"]:
+            logger.info(
+                f"Backfilled statement metadata: "
+                f"metadata_rows={result['metadata_updated']}, "
+                f"summary_rows={result['summary_updated']}"
+            )
+    except Exception as e:
+        logger.warning(f"Statement metadata backfill failed: {e}")
 
 
 def run_gmail_fetch(db: Database, full: bool = False,
@@ -445,7 +470,7 @@ def discover_local_pdfs(db: Database) -> list:
     return pdfs
 
 
-def run_unlock(pdf_infos: list) -> list:
+def run_unlock(pdf_infos: list, db: Database = None) -> list:
     logger = get_logger("pipeline.unlock")
     logger.info("=" * 60)
     logger.info("STEP 2: PDF Unlock")
@@ -469,6 +494,18 @@ def run_unlock(pdf_infos: list) -> list:
             logger.warning(f"Could not unlock: {info['filename']}")
             info["unlocked_path"] = None
             info["error"] = "Failed to unlock PDF"
+            # Record in DB so this PDF is skipped in future runs (until --reprocess)
+            if db and info.get("file_hash"):
+                db.record_statement(
+                    file_hash=info["file_hash"],
+                    original_path=info["path"],
+                    bank=info.get("bank", "unknown"),
+                    filename=info.get("filename"),
+                )
+                db.update_statement_status(
+                    info["file_hash"], "unlock_failed", 0,
+                    "PDF password not available — add password to .env CUSTOM_PASSWORDS and run --reprocess"
+                )
 
     logger.info(f"Unlock complete: {len(results)}/{len(pdf_infos)} successful")
     return results
@@ -622,6 +659,7 @@ def run_pipeline(full: bool = False, local_only: bool = False,
         results = pipeline.process_folder(folder, bank=detected_bank)
         total_txns = sum(r["transaction_count"] for r in results)
         logger.info(f"Folder processing complete: {total_txns} transactions")
+        _backfill_statement_metadata(db, logger)
         run_log.log_gmail_fetch(skipped=True)
         run_log.log_organize({"moved_raw": 0, "moved_unlocked": 0})
         run_log.log_backfill({"transactions": 0, "statements": 0})
@@ -632,11 +670,22 @@ def run_pipeline(full: bool = False, local_only: bool = False,
         return
 
     if reprocess:
-        logger.info("Reprocess mode: resetting all statement statuses")
+        logger.info("Reprocess mode: resetting all statement statuses and clearing transactions")
         with db._get_conn() as conn:
+            # Fetch file hashes being reset so we can delete their transactions
+            rows = conn.execute(
+                "SELECT file_hash FROM statements_metadata WHERE status = 'completed'"
+            ).fetchall()
+            hashes = [r[0] for r in rows if r[0]]
+            if hashes:
+                placeholders = ",".join("?" * len(hashes))
+                conn.execute(
+                    f"DELETE FROM transactions WHERE file_hash IN ({placeholders})",
+                    hashes,
+                )
             conn.execute(
                 "UPDATE statements_metadata SET status = 'pending', "
-                "processed_at = NULL WHERE status = 'completed'"
+                "processed_at = NULL WHERE status IN ('completed', 'unlock_failed')"
             )
 
     downloaded = []
@@ -653,8 +702,7 @@ def run_pipeline(full: bool = False, local_only: bool = False,
     run_log.log_backfill(backfill)
 
     cleaned = cleanup_irrelevant_records(db)
-    csb_cleaned = cleanup_csb_edge_artifacts(db)
-    run_log.log_cleanup(cleaned, csb_cleaned)
+    run_log.log_cleanup(cleaned, {})
 
     all_pdfs = discover_local_pdfs(db)
 
@@ -665,13 +713,17 @@ def run_pipeline(full: bool = False, local_only: bool = False,
 
     if not all_pdfs:
         logger.info("No new PDFs to process")
+        # Still run backfill in case existing records are missing derived fields
+        _backfill_statement_metadata(db, logger)
         summary = db.get_summary()
         run_log.log_summary(summary, new_transactions=0)
         run_log.finish()
         return
 
-    unlocked = run_unlock(all_pdfs)
+    unlocked = run_unlock(all_pdfs, db=db)
     total_inserted = run_parse_and_store(unlocked, db, run_log=run_log, event_logger=event_logger)
+
+    _backfill_statement_metadata(db, logger)
 
     try:
         config = load_config()

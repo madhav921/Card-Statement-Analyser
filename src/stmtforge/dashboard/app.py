@@ -300,8 +300,8 @@ def main():
         Analyze spend across all your banks and cards
     </p>
     """, unsafe_allow_html=True)
-    tab_analytics, tab_statements, tab_parse = st.tabs(
-        ["Analytics", "Statements", "Parse PDF"]
+    tab_analytics, tab_statements, tab_stmt_analysis, tab_parse = st.tabs(
+        ["Analytics", "Statements", "Monthly Analysis", "Parse PDF"]
     )
 
     with tab_parse:
@@ -321,6 +321,8 @@ def main():
                 "3. Run `python run_pipeline.py`\n"
                 "4. Refresh this dashboard — or use **Parse PDF** above to import a statement now"
             )
+        with tab_stmt_analysis:
+            st.info("No statements found yet. Run the pipeline or use Parse PDF.")
         return
 
     if hasattr(db, "get_date_anchor_options"):
@@ -490,6 +492,9 @@ def main():
     with tab_statements:
         _render_statements(db)
 
+    with tab_stmt_analysis:
+        _render_monthly_analysis(db)
+
 
 # ── Analytics tab renderer ────────────────────────────────────────────────────
 
@@ -511,14 +516,15 @@ def _render_analytics(df: "pd.DataFrame") -> None:
 
     total_spend = debits["amount"].sum()
     total_credit = credits["amount"].sum()
+    net_bill = total_spend - total_credit
     num_months = max(debits["month"].nunique(), 1)
     avg_monthly = total_spend / num_months
     top_category = debits.groupby("category")["amount"].sum().idxmax() if not debits.empty else "N/A"
     num_txns = len(df)
 
-    m1.metric("Total Spend", format_inr(total_spend))
-    m2.metric("Total Credits", format_inr(total_credit))
-    m3.metric("Avg Monthly", format_inr(avg_monthly))
+    m1.metric("Total Spend", format_inr(total_spend), help="Sum of all debit transactions (purchases, EMIs, fees)")
+    m2.metric("Total Payments & Refunds", format_inr(total_credit), help="Sum of all credits: bill payments you made + merchant refunds/cashbacks. High value is expected — it means you paid your bills regularly.")
+    m3.metric("Outstanding Balance", format_inr(net_bill), help="Total Spend minus all Payments & Refunds. This is the approximate unpaid balance across all cards (typically just the latest statement cycle).")
     m4.metric("Top Category", top_category)
     m5.metric("Transactions", f"{num_txns:,}")
 
@@ -551,7 +557,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
                 hovermode="x unified",
                 height=350,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with chart_col2:
         st.markdown('<div class="chart-title">Category Breakdown</div>', unsafe_allow_html=True)
@@ -571,7 +577,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
                 pull=[0.03 if i == 0 else 0 for i in range(len(cat_spend))],
             )])
             fig.update_layout(**PLOTLY_LAYOUT, height=350, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     # ── Charts Row 2 ─────────────────────────────────────────────
     chart_col3, chart_col4 = st.columns(2)
@@ -595,7 +601,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
             )])
             fig.update_layout(**PLOTLY_LAYOUT, xaxis_tickprefix="₹", height=400)
             fig.update_layout(yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with chart_col4:
         st.markdown('<div class="chart-title">Spend by Bank & Card</div>', unsafe_allow_html=True)
@@ -623,7 +629,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
                     yaxis_tickprefix="₹",
                     height=400,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
         else:
             bank_spend = debits.groupby("bank")["amount"].sum().reset_index()
             bank_spend = bank_spend.sort_values("amount", ascending=False)
@@ -643,7 +649,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
                     yaxis_tickprefix="₹",
                     height=400,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
     # ── Daily Heatmap ─────────────────────────────────────────────
     st.markdown("---")
@@ -664,7 +670,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
         )
         fig.update_layout(**PLOTLY_LAYOUT, height=280, coloraxis_colorbar=dict(title="Spend (₹)", tickprefix="₹", bgcolor="rgba(0,0,0,0)"))
         fig.update_layout(yaxis=dict(categoryorder="array", categoryarray=day_order[::-1], gridcolor="rgba(0,0,0,0)"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     # ── Category Drill-down ───────────────────────────────────────
     st.markdown("---")
@@ -690,7 +696,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
                     hovertemplate="<b>%{x}</b><br>₹%{y:,.0f}<extra></extra>",
                 )])
                 fig.update_layout(**PLOTLY_LAYOUT, yaxis_tickprefix="₹", height=350)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
         with drill_col2:
             cat_merchants = cat_df.groupby("description")["amount"].sum().nlargest(10).reset_index()
@@ -704,7 +710,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
                 )])
                 fig.update_layout(**PLOTLY_LAYOUT, xaxis_tickprefix="₹", height=350)
                 fig.update_layout(yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
     # ── Transaction Table ─────────────────────────────────────────
     st.markdown("---")
@@ -736,7 +742,7 @@ def _render_analytics(df: "pd.DataFrame") -> None:
 
     st.dataframe(
         display_df.iloc[start_idx:end_idx],
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
     )
     st.caption(f"Showing {start_idx + 1}-{min(end_idx, len(display_df))} of {len(display_df)} transactions")
@@ -767,6 +773,7 @@ def _load_statements(_db):
         rows = conn.execute(
             "SELECT bank, card_name, filename, status, transaction_count, "
             "email_date, statement_period_start, statement_period_end, "
+            "total_amount_due, total_spends, total_credits, "
             "error_message, created_at "
             "FROM statements_metadata ORDER BY created_at DESC"
         ).fetchall()
@@ -814,7 +821,7 @@ def _render_statements(db) -> None:
                 },
             )
             fig.update_layout(**PLOTLY_LAYOUT, showlegend=True, height=300)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     st.markdown("---")
 
@@ -844,12 +851,347 @@ def _render_statements(db) -> None:
         "email_date": "Email Date",
         "statement_period_start": "Period Start",
         "statement_period_end": "Period End",
+        "total_amount_due": "Total Due (₹)",
+        "total_spends": "Spends (₹)",
+        "total_credits": "Credits (₹)",
         "error_message": "Error",
     })
     filtered_sm = filtered_sm.drop(columns=["created_at"], errors="ignore")
 
-    st.dataframe(filtered_sm, use_container_width=True, hide_index=True)
+    st.dataframe(filtered_sm, width='stretch', hide_index=True)
     st.caption(f"{len(filtered_sm)} of {len(sm)} statements shown")
+
+
+# ── Monthly Statement Analysis tab ───────────────────────────────────────────
+
+@st.cache_data(ttl=300)
+def _load_statement_months(_db):
+    return _db.get_statement_months()
+
+
+@st.cache_data(ttl=300)
+def _load_statements_for_month(_db, year_month: str):
+    return _db.get_statements_for_month(year_month)
+
+
+@st.cache_data(ttl=300)
+def _load_txns_for_hashes(_db, hashes_tuple: tuple):
+    return _db.get_transactions_for_file_hashes(list(hashes_tuple))
+
+
+def _fmt_period(start, end) -> str:
+    """Return a human-readable billing period string, safely handling None/NaN."""
+    def _fmt(d):
+        if d is None:
+            return "?"
+        s = str(d).strip()
+        if not s or s.lower() in ("nan", "none", "nat", ""):
+            return "?"
+        try:
+            return pd.to_datetime(s, dayfirst=False).strftime("%d %b %Y")
+        except Exception:
+            return s
+    return f"{_fmt(start)} → {_fmt(end)}"
+
+
+def _txn_period(txns: pd.DataFrame) -> str:
+    """Return 'DD Mon YYYY → DD Mon YYYY' from actual transaction dates."""
+    if txns.empty or "date" not in txns.columns:
+        return "? → ?"
+    dates = pd.to_datetime(txns["date"], errors="coerce").dropna()
+    if dates.empty:
+        return "? → ?"
+    return f"{dates.min().strftime('%d %b %Y')} → {dates.max().strftime('%d %b %Y')}"
+
+
+def _render_monthly_analysis(db) -> None:
+    """Render the Monthly Statement Analysis tab."""
+    st.markdown('<div class="chart-title">📅 Monthly Card Statement Analysis</div>', unsafe_allow_html=True)
+    st.caption("Select a billing month to drill into per-card statement details, spend breakdown, and transaction history.")
+
+    # ── Month selector ────────────────────────────────────────────
+    months = _load_statement_months(db)
+    if not months:
+        st.info("No processed statements found. Run the pipeline or parse a PDF first.")
+        return
+
+    def _month_label(ym: str) -> str:
+        try:
+            return pd.to_datetime(ym + "-01").strftime("%B %Y")
+        except Exception:
+            return ym
+
+    month_labels = [_month_label(m) for m in months]
+    month_map = dict(zip(month_labels, months))
+
+    col_sel, col_info = st.columns([2, 3])
+    with col_sel:
+        selected_label = st.selectbox(
+            "📆 Billing Month",
+            options=month_labels,
+            index=0,
+        )
+    selected_ym = month_map[selected_label]
+
+    # ── Load statements for selected month ────────────────────────
+    sm = _load_statements_for_month(db, selected_ym)
+
+    if sm.empty:
+        st.info(f"No statements found for {selected_label}.")
+        return
+
+    # Separate completed vs others
+    completed = sm[sm["status"] == "completed"].copy()
+    others = sm[sm["status"] != "completed"].copy()
+
+    # ── Aggregate top metrics ─────────────────────────────────────
+    all_hashes = [str(h) for h in completed["file_hash"].dropna().unique().tolist()]
+    all_txns = _load_txns_for_hashes(db, tuple(all_hashes)) if all_hashes else pd.DataFrame()
+
+    if not all_txns.empty:
+        all_txns["date"] = pd.to_datetime(all_txns["date"], errors="coerce")
+        all_debits = all_txns[all_txns["type"] == "debit"]
+        all_credits = all_txns[all_txns["type"] == "credit"]
+    else:
+        all_debits = pd.DataFrame()
+        all_credits = pd.DataFrame()
+
+    skipped_count = len(others[others["status"] == "skipped_irrelevant"]) if not others.empty else 0
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Statements", len(sm), delta=f"-{skipped_count} skipped" if skipped_count else None, delta_color="inverse")
+    mc2.metric("✅ Parsed", len(completed))
+    mc3.metric("Transactions", len(all_txns) if not all_txns.empty else 0)
+    mc4.metric("Total Spend", format_inr(all_debits["amount"].sum()) if not all_debits.empty else "₹0")
+    mc5.metric("Total Credits", format_inr(all_credits["amount"].sum()) if not all_credits.empty else "₹0")
+
+    # ── Month-level charts (only when >1 card) ────────────────────
+    if len(completed) > 1 and not all_debits.empty:
+        st.markdown("---")
+        st.markdown("#### Month-level Breakdown")
+
+        ov_col1, ov_col2 = st.columns(2)
+
+        with ov_col1:
+            st.markdown('<div class="chart-title">Spend by Card</div>', unsafe_allow_html=True)
+            # Join card_name onto all_debits via file_hash
+            hash_to_card = dict(zip(completed["file_hash"], completed.apply(
+                lambda r: f"{(r.get('bank') or 'unknown').upper()} · {r['card_name']}" if pd.notna(r.get("card_name")) else (r.get("bank") or "unknown").upper(),
+                axis=1,
+            )))
+            card_spend = (
+                all_debits.assign(card_label=all_debits["file_hash"].map(hash_to_card))
+                .groupby("card_label")["amount"].sum()
+                .reset_index(name="amount")
+                .sort_values("amount", ascending=False)
+            )
+            if not card_spend.empty:
+                fig = go.Figure(data=[go.Pie(
+                    labels=card_spend["card_label"],
+                    values=card_spend["amount"],
+                    hole=0.55,
+                    marker=dict(colors=CHART_COLORS[:len(card_spend)], line=dict(color="#0f172a", width=2)),
+                    textinfo="percent+label",
+                    textposition="outside",
+                    textfont=dict(size=11, color="#e2e8f0"),
+                    hovertemplate="<b>%{label}</b><br>₹%{value:,.0f}<br>%{percent}<extra></extra>",
+                )])
+                fig.update_layout(**PLOTLY_LAYOUT, height=300, showlegend=False)
+                st.plotly_chart(fig, width='stretch')
+
+        with ov_col2:
+            st.markdown('<div class="chart-title">Category Breakdown (All Cards)</div>', unsafe_allow_html=True)
+            cat_spend = all_debits.groupby("category")["amount"].sum().reset_index(name="amount")
+            cat_spend = cat_spend.sort_values("amount", ascending=False)
+            if not cat_spend.empty:
+                fig = go.Figure(data=[go.Bar(
+                    x=cat_spend["amount"],
+                    y=cat_spend["category"],
+                    orientation="h",
+                    marker=dict(
+                        color=CHART_COLORS[:len(cat_spend)],
+                        cornerradius=4,
+                        line=dict(width=0),
+                    ),
+                    hovertemplate="<b>%{y}</b><br>₹%{x:,.0f}<extra></extra>",
+                )])
+                fig.update_layout(**PLOTLY_LAYOUT, xaxis_tickprefix="₹", height=300)
+                fig.update_layout(yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"))
+                st.plotly_chart(fig, width='stretch')
+
+    # ── Per-statement card sections ───────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Per-Card Statement Details")
+
+    if completed.empty:
+        st.info("No successfully parsed statements for this month.")
+    else:
+        for idx, (_, stmt_row) in enumerate(completed.iterrows()):
+            bank = (stmt_row.get("bank") or "unknown").upper()
+            card_name = stmt_row.get("card_name") or ""
+            card_last4 = stmt_row.get("card_last4") or ""
+            filename = stmt_row.get("filename") or "—"
+            file_hash = stmt_row.get("file_hash")
+            txn_count_meta = int(stmt_row.get("transaction_count") or 0)
+
+            # Load transactions early so we can derive the actual period
+            stmt_txns = _load_txns_for_hashes(db, (str(file_hash),)) if file_hash else pd.DataFrame()
+            if not stmt_txns.empty:
+                stmt_txns["date"] = pd.to_datetime(stmt_txns["date"], errors="coerce")
+
+            # Determine billing period: prefer DB fields, fall back to transaction date range
+            db_period_start = stmt_row.get("statement_period_start")
+            db_period_end = stmt_row.get("statement_period_end")
+            db_period_str = _fmt_period(db_period_start, db_period_end)
+            if db_period_str == "? → ?":
+                # Derive from actual transaction dates
+                period = _txn_period(stmt_txns)
+            else:
+                period = db_period_str
+
+            stmt_debits = stmt_txns[stmt_txns["type"] == "debit"] if not stmt_txns.empty else pd.DataFrame()
+            stmt_credits = stmt_txns[stmt_txns["type"] == "credit"] if not stmt_txns.empty else pd.DataFrame()
+
+            # Card header label
+            card_label = f"{bank}"
+            if card_name:
+                card_label += f" · {card_name}"
+            if card_last4:
+                card_label += f" (····{card_last4})"
+
+            total_spend = format_inr(stmt_debits["amount"].sum()) if not stmt_debits.empty else "₹0"
+            with st.expander(f"🏦 {card_label}   |   📅 {period}   |   {total_spend}", expanded=True):
+
+                # ── Statement header info ─────────────────────────
+                info_col, _ = st.columns([3, 1])
+                with info_col:
+                    st.caption(
+                        f"📄 **File:** {filename}  |  "
+                        f"📅 **Statement Period:** {period}  |  "
+                        f"📧 **Email date:** {stmt_row.get('email_date') or '—'}"
+                    )
+
+                # ── Key metrics ───────────────────────────────────
+                km1, km2, km3, km4, km5 = st.columns(5)
+                km1.metric("Total Spend", format_inr(stmt_debits["amount"].sum()) if not stmt_debits.empty else "₹0")
+                km2.metric("Total Credits", format_inr(stmt_credits["amount"].sum()) if not stmt_credits.empty else "₹0")
+                net = (stmt_debits["amount"].sum() if not stmt_debits.empty else 0) - (stmt_credits["amount"].sum() if not stmt_credits.empty else 0)
+                # Show canonical Total Amount Due from statement summary if available
+                stmt_total_due = stmt_row.get("total_amount_due")
+                if stmt_total_due is not None and not pd.isna(stmt_total_due):
+                    km3.metric("Total Amount Due", format_inr(float(stmt_total_due)), help="From statement summary")
+                else:
+                    km3.metric("Net Spend", format_inr(net))
+                km4.metric("Transactions", len(stmt_txns) if not stmt_txns.empty else txn_count_meta)
+                if not stmt_debits.empty and "category" in stmt_debits.columns and stmt_debits["category"].notna().any():
+                    top_cat = stmt_debits.groupby("category")["amount"].sum().idxmax()
+                    km5.metric("Top Category", top_cat)
+                else:
+                    km5.metric("Top Category", "—")
+
+                if stmt_txns.empty:
+                    st.info("No transaction details available for this statement.")
+                    continue
+
+                # ── Charts ────────────────────────────────────────
+                ch1, ch2 = st.columns(2)
+
+                with ch1:
+                    st.markdown('<div class="chart-title">Category Breakdown</div>', unsafe_allow_html=True)
+                    if not stmt_debits.empty and "category" in stmt_debits.columns:
+                        cat_d = stmt_debits.groupby("category")["amount"].sum().reset_index(name="amount")
+                        cat_d = cat_d.sort_values("amount", ascending=False)
+                        fig = go.Figure(data=[go.Pie(
+                            labels=cat_d["category"],
+                            values=cat_d["amount"],
+                            hole=0.5,
+                            marker=dict(colors=CHART_COLORS[:len(cat_d)], line=dict(color="#0f172a", width=2)),
+                            textinfo="percent+label",
+                            textposition="outside",
+                            textfont=dict(size=11, color="#e2e8f0"),
+                            hovertemplate="<b>%{label}</b><br>₹%{value:,.0f}<br>%{percent}<extra></extra>",
+                            pull=[0.03 if i == 0 else 0 for i in range(len(cat_d))],
+                        )])
+                        fig.update_layout(**PLOTLY_LAYOUT, height=280, showlegend=False)
+                        st.plotly_chart(fig, width='stretch')
+
+                with ch2:
+                    st.markdown('<div class="chart-title">Top 10 Merchants</div>', unsafe_allow_html=True)
+                    if not stmt_debits.empty:
+                        merch = stmt_debits.groupby("description")["amount"].sum().nlargest(10).reset_index(name="amount")
+                        fig = go.Figure(data=[go.Bar(
+                            x=merch["amount"],
+                            y=merch["description"],
+                            orientation="h",
+                            marker=dict(
+                                color=merch["amount"],
+                                colorscale=[[0, "#0ea5e9"], [1, "#10b981"]],
+                                cornerradius=4,
+                                line=dict(width=0),
+                            ),
+                            hovertemplate="<b>%{y}</b><br>₹%{x:,.0f}<extra></extra>",
+                        )])
+                        fig.update_layout(**PLOTLY_LAYOUT, xaxis_tickprefix="₹", height=280)
+                        fig.update_layout(yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"))
+                        st.plotly_chart(fig, width='stretch')
+
+                # ── Daily spend trend ─────────────────────────────
+                if not stmt_debits.empty:
+                    daily = stmt_debits.groupby("date")["amount"].sum().reset_index()
+                    st.markdown('<div class="chart-title">Daily Spend Trend</div>', unsafe_allow_html=True)
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=daily["date"],
+                        y=daily["amount"],
+                        marker=dict(color="#0ea5e9", cornerradius=3, line=dict(width=0)),
+                        hovertemplate="<b>%{x|%d %b}</b><br>₹%{y:,.0f}<extra></extra>",
+                    ))
+                    fig.update_layout(**PLOTLY_LAYOUT, yaxis_tickprefix="₹", height=200)
+                    st.plotly_chart(fig, width='stretch')
+
+                # ── Transaction table ─────────────────────────────
+                with st.expander(f"📋 Transactions ({len(stmt_txns)})", expanded=False):
+                    disp = stmt_txns.copy()
+                    show_cols = ["date", "description", "amount", "type", "category", "card_last4"]
+                    show_cols = [c for c in show_cols if c in disp.columns]
+                    disp = disp[show_cols].copy()
+                    disp["date"] = disp["date"].dt.strftime("%Y-%m-%d").fillna("")
+                    disp["amount"] = disp["amount"].apply(lambda x: f"₹{x:,.2f}")
+                    st.dataframe(disp, width='stretch', hide_index=True)
+
+                    # Download
+                    export = stmt_txns[show_cols].copy()
+                    export["date"] = export["date"].dt.strftime("%Y-%m-%d").fillna("")
+                    safe_name = (card_name or bank).replace(" ", "_").replace("/", "_")
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=export.to_csv(index=False).encode("utf-8"),
+                        file_name=f"stmt_{selected_ym}_{safe_name}.csv",
+                        mime="text/csv",
+                        key=f"dl_{file_hash}_{idx}",
+                    )
+
+    # ── Non-completed statements ──────────────────────────────────
+    if not others.empty:
+        skipped = (others["status"] == "skipped_irrelevant").sum()
+        no_data = (others["status"] == "no_data").sum()
+        err = (others["status"] == "error").sum()
+        label_parts = []
+        if skipped:
+            label_parts.append(f"{skipped} skipped/irrelevant")
+        if no_data:
+            label_parts.append(f"{no_data} no data")
+        if err:
+            label_parts.append(f"{err} error")
+        label = ", ".join(label_parts) or str(len(others))
+        st.markdown("---")
+        with st.expander(f"⚠️ Other statements this month ({label})", expanded=False):
+            st.caption("These statements were not parsed. Check the 'Skip Reason' column for details.")
+            disp_others = others[["bank", "card_name", "filename", "status", "error_message"]].copy()
+            disp_others = disp_others.rename(columns={
+                "bank": "Bank", "card_name": "Card", "filename": "File",
+                "status": "Status", "error_message": "Skip Reason",
+            })
+            st.dataframe(disp_others, width='stretch', hide_index=True)
 
 
 # ── Parse PDF helpers ─────────────────────────────────────────────────────────
@@ -1046,7 +1388,7 @@ def _render_parse_pdf(db: "Database") -> None:
         return
 
     # ── Trigger or re-display ────────────────────────────────────
-    result_key = f"_parse_result_{uploaded_file.file_id}"
+    result_key = f"_parse_result_{uploaded_file.name}_{uploaded_file.size}"
 
     if parse_clicked:
         # Clear any previous result for this file
@@ -1066,8 +1408,12 @@ def _render_parse_pdf(db: "Database") -> None:
             return
 
         st.session_state[result_key] = result
-        # Invalidate transaction caches so analytics reflects new data
+        # Invalidate caches so all tabs reflect new data
         load_transactions.clear()
+        _load_statements.clear()
+        _load_statement_months.clear()
+        _load_statements_for_month.clear()
+        _load_txns_for_hashes.clear()
 
     result = st.session_state.get(result_key)
     if result:
@@ -1142,7 +1488,7 @@ def _display_parse_result(result: dict, filename: str) -> None:
     if "amount" in disp.columns:
         disp["amount"] = disp["amount"].apply(lambda x: f"₹{x:,.2f}")
 
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+    st.dataframe(disp, width='stretch', hide_index=True)
 
     # ── Download ──────────────────────────────────────────────────
     export_df = df[display_cols].copy()

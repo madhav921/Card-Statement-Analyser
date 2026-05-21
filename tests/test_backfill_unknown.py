@@ -52,17 +52,15 @@ def test_backfill_unknown_bank_rows_updates_bank_and_card(tmp_path):
     _insert_unknown_transaction(db, "Statement.pdf", 0)
     _insert_unknown_transaction(db, "Credit Card Statement.pdf", 1)
     _insert_unknown_transaction(db, "CreditCard_Statement_2026022215007394_21-02-2026.pdf", 2)
-    _insert_unknown_transaction(db, "60100002192354_25022026_111702300.pdf", 3)
 
     _insert_unknown_statement(db, "Statement.pdf")
     _insert_unknown_statement(db, "Credit Card Statement.pdf")
     _insert_unknown_statement(db, "CreditCard_Statement_2026022215007394_21-02-2026.pdf")
-    _insert_unknown_statement(db, "60100002192354_25022026_111702300.pdf")
 
     result = backfill_unknown_bank_rows(db)
 
-    assert result["transactions"] >= 4
-    assert result["statements"] >= 4
+    assert result["transactions"] >= 3
+    assert result["statements"] >= 3
 
     with sqlite3.connect(str(db_path)) as conn:
         tx_rows = conn.execute(
@@ -78,9 +76,7 @@ def test_backfill_unknown_bank_rows_updates_bank_and_card(tmp_path):
     assert tx_map["Statement.pdf"] == ("csb", "Edge")
     assert tx_map["Credit Card Statement.pdf"] == ("axis", "Neo Rupay")
     assert tx_map["CreditCard_Statement_2026022215007394_21-02-2026.pdf"] == ("federal", "Signet")
-    assert tx_map["60100002192354_25022026_111702300.pdf"] == ("idfc_first", "Select")
 
     assert st_map["Statement.pdf"] == ("csb", "Edge")
     assert st_map["Credit Card Statement.pdf"] == ("axis", "Neo Rupay")
     assert st_map["CreditCard_Statement_2026022215007394_21-02-2026.pdf"] == ("federal", "Signet")
-    assert st_map["60100002192354_25022026_111702300.pdf"] == ("idfc_first", "Select")

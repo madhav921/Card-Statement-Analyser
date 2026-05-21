@@ -1,5 +1,6 @@
 """SQLite database layer for CCAnalyser."""
 
+import re
 import sqlite3
 import hashlib
 from datetime import datetime
@@ -122,6 +123,9 @@ class Database:
             self._migrate_add_column(conn, "statements_metadata", "card_name", "TEXT")
             self._migrate_add_column(conn, "statements_metadata", "email_subject", "TEXT")
             self._migrate_add_column(conn, "statements_metadata", "filename", "TEXT")
+            self._migrate_add_column(conn, "statements_metadata", "total_amount_due", "REAL")
+            self._migrate_add_column(conn, "statements_metadata", "total_spends", "REAL")
+            self._migrate_add_column(conn, "statements_metadata", "total_credits", "REAL")
             self._migrate_add_column(conn, "gmail_messages", "email_subject", "TEXT")
 
             # Create indexes on new columns (after migration)
@@ -132,8 +136,15 @@ class Database:
 
         logger.debug("Database initialized")
 
+    _ALLOWED_MIGRATE_TABLES = frozenset({
+        "transactions", "statements_metadata", "gmail_messages",
+        "pipeline_state", "extraction_log",
+    })
+
     def _migrate_add_column(self, conn, table: str, column: str, col_type: str):
         """Add a column to a table if it doesn't already exist."""
+        if table not in self._ALLOWED_MIGRATE_TABLES:
+            raise ValueError(f"_migrate_add_column: disallowed table '{table}'")
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
             logger.info(f"Migrated: added {column} to {table}")
@@ -423,6 +434,343 @@ class Database:
             ).fetchall()
         return [r[0] for r in rows]
 
+    # ── Statement-level analysis methods ────────────────────────
+
+    # Regex patterns to extract a date from common CC statement filenames.
+    # Each pattern must have named groups: year, month (and optionally day).
+    _MONTH_ABBR = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+
+    _FILENAME_DATE_PATTERNS = [
+        # SBI:  6805786524927007_15042026.pdf → DDMMYYYY → Apr 2026
+        re.compile(r"_(\d{2})(\d{2})(\d{4})(?:_\d+)?\.pdf$", re.IGNORECASE),
+        # HDFC: 5268XXXXXXXXXX38_19-03-2026_177.pdf → DD-MM-YYYY → Mar 2026
+        re.compile(r"_(\d{2})-(\d{2})-(\d{4})(?:_\d+)?\.pdf$", re.IGNORECASE),
+        # IDFC: <account>_25102025_112046900.pdf → DDMMYYYY → Oct 2025
+        # (same first pattern covers this)
+        # Federal: CreditCard_Statement_2026022215007394_21-02-2026.pdf → DD-MM-YYYY
+        re.compile(r"_(\d{2})-(\d{2})-(\d{4})\.pdf$", re.IGNORECASE),
+        # ICICI: Statement_AUG2024_432681569.pdf → MONYYYY → Aug 2024
+        re.compile(r"_([A-Za-z]{3})(\d{4})_", re.IGNORECASE),
+        # ICICI: Statement_2024MTH05_681569432.pdf → YYYYMTHmm → May 2024
+        re.compile(r"_(\d{4})MTH(\d{2})_", re.IGNORECASE),
+        # ICICI: Statement_SEP2025_432681569.pdf (same as MON pattern above)
+        # YES Bank / others: _2025_09_ or _202509_
+        re.compile(r"_(\d{4})(\d{2})(?:_|\.)pdf", re.IGNORECASE),
+    ]
+
+    @classmethod
+    def _billing_month_from_filename(cls, filename: str | None) -> str | None:
+        """Try to extract YYYY-MM from known filename patterns.
+
+        Returns None when the filename doesn't match any known pattern.
+        """
+        if not filename or not isinstance(filename, str):
+            return None
+        for i, pat in enumerate(cls._FILENAME_DATE_PATTERNS):
+            m = pat.search(filename)
+            if not m:
+                continue
+            try:
+                if i <= 2:
+                    # DD MM YYYY (groups 1,2,3)
+                    yr = int(m.group(3))
+                    mm = int(m.group(2))
+                    if 1 <= mm <= 12 and 2000 <= yr <= 2100:
+                        return f"{yr:04d}-{mm:02d}"
+                elif i == 3:
+                    # MON YYYY (groups 1=abbr, 2=year)
+                    mon_abbr = m.group(1).lower()
+                    yr = int(m.group(2))
+                    mm = cls._MONTH_ABBR.get(mon_abbr)
+                    if mm and 2000 <= yr <= 2100:
+                        return f"{yr:04d}-{mm:02d}"
+                elif i == 4:
+                    # YYYY MTH mm (groups 1=year, 2=month)
+                    yr = int(m.group(1))
+                    mm = int(m.group(2))
+                    if 1 <= mm <= 12 and 2000 <= yr <= 2100:
+                        return f"{yr:04d}-{mm:02d}"
+                elif i == 5:
+                    # YYYY MM (groups 1=year, 2=month)
+                    yr = int(m.group(1))
+                    mm = int(m.group(2))
+                    if 1 <= mm <= 12 and 2000 <= yr <= 2100:
+                        return f"{yr:04d}-{mm:02d}"
+            except (ValueError, IndexError):
+                continue
+        return None
+
+    def get_statement_months(self) -> list:
+        """Return distinct YYYY-MM values available in statements_metadata.
+
+        Priority order for determining billing month (must match _row_billing_month):
+          1. statement_period_start (if set)
+          2. Date extracted from filename
+          3. email_date
+          4. created_at
+        """
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    file_hash, bank, filename,
+                    NULLIF(TRIM(statement_period_start), '') AS period_start,
+                    NULLIF(TRIM(email_date), '') AS email_date,
+                    created_at
+                FROM statements_metadata
+                WHERE status IN ('completed', 'no_data', 'error', 'skipped_irrelevant')
+            """).fetchall()
+
+        import pandas as _pd
+        months: set[str] = set()
+        for r in rows:
+            # r: (file_hash, bank, filename, period_start, email_date, created_at)
+            # 1. statement_period_start (highest priority — consistent with _row_billing_month)
+            if r[3]:
+                try:
+                    dt = _pd.to_datetime(r[3][:10], errors="coerce")
+                    if not _pd.isna(dt):
+                        months.add(dt.strftime("%Y-%m"))
+                        continue
+                except Exception:
+                    pass
+            # 2. Filename-derived month
+            fn_month = self._billing_month_from_filename(r[2])
+            if fn_month:
+                months.add(fn_month)
+                continue
+            # 3. email_date
+            if r[4]:
+                try:
+                    dt = _pd.to_datetime(r[4][:10], errors="coerce")
+                    if not _pd.isna(dt):
+                        months.add(dt.strftime("%Y-%m"))
+                        continue
+                except Exception:
+                    pass
+            # 4. created_at
+            if r[5]:
+                try:
+                    dt = _pd.to_datetime(r[5][:10], errors="coerce")
+                    if not _pd.isna(dt):
+                        months.add(dt.strftime("%Y-%m"))
+                except Exception:
+                    pass
+
+        return sorted(months, reverse=True)
+
+    def get_statements_for_month(self, year_month: str) -> pd.DataFrame:
+        """Load statements_metadata rows that belong to a given YYYY-MM.
+
+        Billing month resolution (priority order):
+          1. statement_period_start
+          2. Date extracted from filename
+          3. email_date
+          4. created_at
+
+        Deduplication: when the same logical file (same bank + filename) was
+        processed multiple times (different file_hashes), keep only one row per
+        (bank, card_name, filename) group, preferring the most-recent
+        ``completed`` entry, then other statuses by recency.
+        """
+        with self._get_conn() as conn:
+            all_rows = pd.read_sql_query("""
+                SELECT
+                    sm.file_hash, sm.bank, sm.card_name, sm.card_last4,
+                    sm.filename, sm.email_date, sm.statement_period_start,
+                    sm.statement_period_end, sm.transaction_count, sm.status,
+                    sm.total_amount_due, sm.total_spends, sm.total_credits,
+                    sm.error_message, sm.created_at
+                FROM statements_metadata sm
+                WHERE sm.status IN ('completed', 'no_data', 'error', 'skipped_irrelevant')
+                ORDER BY sm.bank, sm.card_name, sm.email_date, sm.created_at DESC
+            """, conn)
+
+        if all_rows.empty:
+            return all_rows
+
+        # ── Determine billing month for each row ─────────────────
+        def _row_billing_month(row) -> str | None:
+            def _safe_str(v):
+                """Return stripped string or None for NaN/None/empty."""
+                if v is None:
+                    return None
+                s = str(v).strip()
+                return s if s and s.lower() not in ("nan", "none", "nat") else None
+
+            # 1. statement_period_start
+            sp = _safe_str(row.get("statement_period_start"))
+            if sp:
+                try:
+                    dt = pd.to_datetime(sp[:10], errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m")
+                except Exception:
+                    pass
+            # 2. filename-derived
+            fn_month = self._billing_month_from_filename(_safe_str(row.get("filename")))
+            if fn_month:
+                return fn_month
+            # 3. email_date
+            ed = _safe_str(row.get("email_date"))
+            if ed:
+                try:
+                    dt = pd.to_datetime(ed[:10], errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m")
+                except Exception:
+                    pass
+            # 4. created_at
+            ca = _safe_str(row.get("created_at"))
+            if ca:
+                try:
+                    dt = pd.to_datetime(ca[:10], errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m")
+                except Exception:
+                    pass
+            return None
+
+        all_rows["_billing_month"] = all_rows.apply(_row_billing_month, axis=1)
+
+        # ── Filter to the requested month ─────────────────────────
+        month_rows = all_rows[all_rows["_billing_month"] == year_month].copy()
+        month_rows = month_rows.drop(columns=["_billing_month"])
+
+        if month_rows.empty:
+            return month_rows
+
+        # ── Deduplicate: keep one row per (bank, card_name, filename) ─
+        # Priority: completed > others; within same status, keep most recent.
+        STATUS_RANK = {"completed": 0, "no_data": 1, "error": 2, "skipped_irrelevant": 3}
+        month_rows["_status_rank"] = month_rows["status"].map(
+            lambda s: STATUS_RANK.get(s, 9)
+        )
+        month_rows["_created_ts"] = pd.to_datetime(
+            month_rows["created_at"], errors="coerce"
+        )
+        month_rows = month_rows.sort_values(
+            ["_status_rank", "_created_ts"],
+            ascending=[True, False],
+        )
+        dedup_key = month_rows.apply(
+            lambda r: (
+                str(r.get("bank") or ""),
+                str(r.get("card_name") or ""),
+                str(r.get("filename") or ""),
+            ),
+            axis=1,
+        )
+        month_rows = month_rows[~dedup_key.duplicated(keep="first")].copy()
+        month_rows = month_rows.drop(
+            columns=["_status_rank", "_created_ts"], errors="ignore"
+        )
+
+        return month_rows.reset_index(drop=True)
+
+    def get_transactions_for_file_hashes(self, file_hashes: list) -> pd.DataFrame:
+        """Load all transactions for a list of file_hashes."""
+        if not file_hashes:
+            return pd.DataFrame()
+        placeholders = ",".join("?" * len(file_hashes))
+        with self._get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT * FROM transactions WHERE file_hash IN ({placeholders}) ORDER BY date",
+                conn, params=file_hashes,
+            )
+        return df
+
+    def backfill_statement_metadata(self) -> dict:
+        """Backfill card_name, period dates, and financial totals for completed statements
+        that have NULL values in those fields, deriving them from existing transactions.
+        Returns counts of updated rows."""
+        updated_metadata = 0
+        updated_summary = 0
+
+        with self._get_conn() as conn:
+            # Find completed statements missing at least one derived field
+            rows = conn.execute("""
+                SELECT sm.file_hash
+                FROM statements_metadata sm
+                WHERE sm.status = 'completed'
+                  AND (
+                      sm.card_name IS NULL OR sm.card_name = ''
+                      OR sm.statement_period_start IS NULL OR sm.statement_period_start = ''
+                      OR sm.statement_period_end IS NULL OR sm.statement_period_end = ''
+                      OR sm.total_spends IS NULL
+                  )
+            """).fetchall()
+
+            for row in rows:
+                fhash = row[0]
+
+                # Fetch aggregated data from transactions in one query
+                agg = conn.execute("""
+                    SELECT
+                        MIN(date) as min_date,
+                        MAX(date) as max_date,
+                        MAX(card_name) as card_name,
+                        SUM(CASE WHEN type = 'debit' THEN amount ELSE 0 END) as total_spends,
+                        SUM(CASE WHEN type = 'credit' THEN amount ELSE 0 END) as total_credits
+                    FROM transactions
+                    WHERE file_hash = ?
+                """, (fhash,)).fetchone()
+
+                if not agg or agg[0] is None:
+                    continue  # No transactions for this statement
+
+                min_date, max_date, card_name, total_spends, total_credits = agg
+
+                # Normalise dates to YYYY-MM-DD
+                period_start = None
+                period_end = None
+                try:
+                    period_start = pd.to_datetime(min_date, errors="coerce")
+                    period_start = period_start.strftime("%Y-%m-%d") if not pd.isnull(period_start) else None
+                except Exception:
+                    pass
+                try:
+                    period_end = pd.to_datetime(max_date, errors="coerce")
+                    period_end = period_end.strftime("%Y-%m-%d") if not pd.isnull(period_end) else None
+                except Exception:
+                    pass
+
+                conn.execute("""
+                    UPDATE statements_metadata
+                    SET
+                        card_name = CASE
+                            WHEN (card_name IS NULL OR card_name = '') AND ? IS NOT NULL THEN ?
+                            ELSE card_name END,
+                        statement_period_start = CASE
+                            WHEN (statement_period_start IS NULL OR statement_period_start = '') AND ? IS NOT NULL THEN ?
+                            ELSE statement_period_start END,
+                        statement_period_end = CASE
+                            WHEN (statement_period_end IS NULL OR statement_period_end = '') AND ? IS NOT NULL THEN ?
+                            ELSE statement_period_end END
+                    WHERE file_hash = ?
+                """, (card_name, card_name,
+                      period_start, period_start,
+                      period_end, period_end,
+                      fhash))
+                if conn.total_changes:
+                    updated_metadata += 1
+
+                conn.execute("""
+                    UPDATE statements_metadata
+                    SET
+                        total_spends = CASE WHEN total_spends IS NULL AND ? > 0 THEN ? ELSE total_spends END,
+                        total_credits = CASE WHEN total_credits IS NULL AND ? > 0 THEN ? ELSE total_credits END
+                    WHERE file_hash = ?
+                """, (total_spends, total_spends,
+                      total_credits, total_credits,
+                      fhash))
+                if conn.total_changes:
+                    updated_summary += 1
+
+        return {"metadata_updated": updated_metadata, "summary_updated": updated_summary}
+
     def export_attachment_metadata_csv(self, output_path: str) -> str:
         """Export all statement metadata to CSV."""
         with self._get_conn() as conn:
@@ -456,7 +804,10 @@ class Database:
                      email_subject, filename, sender, message_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(file_hash) DO UPDATE SET
-                        card_name = excluded.card_name
+                        card_name = excluded.card_name,
+                        bank = CASE WHEN excluded.bank != 'unknown'
+                                    THEN excluded.bank
+                                    ELSE statements_metadata.bank END
                 """, (file_hash, original_path, bank, card_name, email_date,
                        email_subject, filename, sender, message_id))
                 return conn.total_changes > 0
@@ -475,14 +826,50 @@ class Database:
                 WHERE file_hash = ?
             """, (status, transaction_count, error_message, file_hash))
 
+    def update_statement_summary(self, file_hash: str,
+                                 total_amount_due: float = None,
+                                 total_spends: float = None,
+                                 total_credits: float = None):
+        """Store statement financial summary (total due, spends, credits) in metadata."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                UPDATE statements_metadata
+                SET total_amount_due = ?, total_spends = ?, total_credits = ?
+                WHERE file_hash = ?
+            """, (total_amount_due, total_spends, total_credits, file_hash))
+
+    def update_statement_metadata(self, file_hash: str,
+                                   card_name: str = None,
+                                   statement_period_start: str = None,
+                                   statement_period_end: str = None):
+        """Fill in derived metadata fields (card_name, period dates) without overwriting existing values."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                UPDATE statements_metadata
+                SET
+                    card_name = CASE
+                        WHEN (card_name IS NULL OR card_name = '') AND ? IS NOT NULL THEN ?
+                        ELSE card_name END,
+                    statement_period_start = CASE
+                        WHEN (statement_period_start IS NULL OR statement_period_start = '') AND ? IS NOT NULL THEN ?
+                        ELSE statement_period_start END,
+                    statement_period_end = CASE
+                        WHEN (statement_period_end IS NULL OR statement_period_end = '') AND ? IS NOT NULL THEN ?
+                        ELSE statement_period_end END
+                WHERE file_hash = ?
+            """, (card_name, card_name,
+                  statement_period_start, statement_period_start,
+                  statement_period_end, statement_period_end,
+                  file_hash))
+
     def is_file_processed(self, file_hash: str) -> bool:
-        """Check if a file has already been successfully processed."""
+        """Check if a file has already been successfully processed, skipped, or unlock-failed."""
         with self._get_conn() as conn:
             row = conn.execute(
                 "SELECT status FROM statements_metadata WHERE file_hash = ?",
                 (file_hash,)
             ).fetchone()
-        return row is not None and row[0] == "completed"
+        return row is not None and row[0] in ("completed", "skipped_irrelevant", "unlock_failed")
 
     # ── Gmail message tracking ───────────────────────────────────
 

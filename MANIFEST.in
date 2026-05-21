@@ -3,8 +3,9 @@ include README.md
 include pyproject.toml
 
 recursive-include src/stmtforge *.py *.yaml
-recursive-include assets *.svg *.png
-recursive-include images *.png *.jpg *.webp
+include assets/banner.svg assets/logo.svg
+
+prune assets/images
 
 exclude .env
 exclude .env.example

@@ -41,6 +41,21 @@ Thumbs.db
 _local_reference/
 
 local/
+tests/
+social_posts/
 
 # Build / migration artifacts
 _transform.py
+
+# One-time maintenance scripts (contain personal file metadata)
+scripts/clean_csb_db.py
+scripts/fix_csb_metadata.py
+scripts/verify_csb.py
+
+# Temp files
+temp_*.log
+temp_*.txt
+
+# Local diagnostic / debug scripts in project root or scripts/
+diag*.py
+scripts/_diag_check.py

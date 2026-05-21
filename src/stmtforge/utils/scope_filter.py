@@ -24,10 +24,11 @@ _DEFAULT_IRRELEVANT_FILENAME_PATTERNS = [
 _DEFAULT_IRRELEVANT_TEXT_KEYWORDS = [
     "wealth daily news",
     "ecowrap",
-    "key fact statement",
-    "most important terms",
-    "card agreement",
-    "application form",
+    # NOTE: "key fact statement", "most important terms", "card agreement",
+    # "application form" are intentionally NOT here — they appear as section
+    # headers INSIDE valid SBI / IDFC First credit card statements.
+    # Those standalone documents are already caught by filename patterns
+    # (KFS_, MITC, Key Fact Statement, CARD_AGREEMENT, Application form).
     "welcome letter",
     "upgrade application",
     "debit card statement",
@@ -38,6 +39,29 @@ _DEFAULT_IRRELEVANT_TEXT_KEYWORDS = [
     "personal loan",
     "fixed deposit",
     "recurring deposit",
+]
+
+# Positive credit-card indicators — if ANY of these appear the document is
+# presumed to be a credit card statement and NOT filtered out, even if it
+# also contains generic terms (e.g. SBI statements mention "Most Important
+# Terms" in an embedded MITC section).
+_CC_POSITIVE_KEYWORDS = [
+    "credit card statement",
+    "credit card account",
+    "card account statement",
+    "statement of account",
+    "sbi card",
+]
+
+# Hard non-cc indicators — these override the positive keywords above.
+_HARD_NON_CC_KEYWORDS = [
+    "savings account statement",
+    "current account statement",
+    "loan account statement",
+    # Application rejection / decline letters (e.g. SBI card application decline)
+    "unable to process your application",
+    "regret to inform you that we are currently unable",
+    "does not meet the criteria set forth in our credit policy",
 ]
 
 _ICICI_SAVINGS_PATTERNS = [
@@ -115,11 +139,30 @@ def is_irrelevant_filename(filename: str, bank: str = "unknown") -> bool:
 
 
 def is_irrelevant_statement_text(text: str) -> bool:
-    """Return True when extracted statement text indicates out-of-scope content."""
+    """Return True when extracted statement text indicates out-of-scope content.
+
+    Positive bypass: if the text clearly says "credit card statement" (or
+    equivalent), the document is treated as a credit card statement even when
+    it also contains generic terms like "most important terms" (which SBI and
+    IDFC First embed inside their CC statement PDFs as an MITC section).
+    """
     if not text:
         return False
 
     normalized = _norm_text(text)
+
+    # --- Hard non-CC checks (override positive indicators) ---
+    for keyword in _HARD_NON_CC_KEYWORDS:
+        if keyword in normalized:
+            return True
+
+    # --- Positive CC indicator bypass ---
+    # If the document clearly identifies itself as a credit card statement,
+    # do NOT filter it out based on generic/cosmetic keywords.
+    if any(kw in normalized for kw in _CC_POSITIVE_KEYWORDS):
+        return False
+
+    # --- Generic irrelevance keywords ---
     for keyword in _DEFAULT_IRRELEVANT_TEXT_KEYWORDS:
         if keyword in normalized:
             return True
@@ -131,6 +174,7 @@ def is_irrelevant_statement_text(text: str) -> bool:
         return True
 
     return False
+
 
 
 def extract_pdf_preview_text(*, pdf_path: str | Path | None = None,

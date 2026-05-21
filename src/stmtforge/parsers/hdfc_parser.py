@@ -33,13 +33,14 @@ class HDFCParser(BaseParser):
         re.IGNORECASE,
     )
 
-    # Newer HDFC format (Aug 2025+): "DD/MM/YYYY| HH:MM DESCRIPTION [C] AMOUNT [l]"
-    # Single-cell rows with date+time, description, optional type, amount, optional trailing char
+    # Newer HDFC format (Aug 2025+): "DD/MM/YYYY| HH:MM DESCRIPTION [+ ]C AMOUNT [l]"
+    # Credits have a leading + before the C currency symbol; debits have just C.
+    # Groups: (1) date, (2) description, (3) '+' or None (credit marker), (4) amount
     TRANSACTION_RE3 = re.compile(
         r"(\d{2}/\d{2}/\d{4})\|\s*\d{2}:\d{2}\s+"  # Date: DD/MM/YYYY| HH:MM
         r"(.+?)\s+"                                   # Description (lazy)
-        r"(?:[CDcd]\s+)?"                             # Optional C/D type indicator
-        r"(\d[\d,]*\.\d{2})\s*[A-Za-z]?\s*$",       # Amount, optional trailing letter
+        r"(\+)?\s*[Cc]\s+"                            # Optional + (credit), then C (currency symbol)
+        r"(\d[\d,]*\.\d{2})\s*[A-Za-z]?\s*$",       # Amount, optional trailing char (PI indicator)
         re.IGNORECASE,
     )
 
@@ -82,13 +83,14 @@ class HDFCParser(BaseParser):
                     if m:
                         date = parse_date(m.group(1), ref_year)
                         description = m.group(2).strip()
-                        amount = parse_amount(m.group(3))
+                        amount = parse_amount(m.group(4))  # group(4) = amount
+                        txn_type = "credit" if m.group(3) else "debit"  # group(3) = '+' or None
                         if date and amount and amount > 0 and len(description) > 2:
                             records.append({
                                 "date": date,
                                 "description": description,
                                 "amount": amount,
-                                "type": detect_debit_credit(description, description),
+                                "type": txn_type,
                                 "card_last4": card_last4,
                                 "balance": None,
                             })
@@ -143,13 +145,14 @@ class HDFCParser(BaseParser):
             if m:
                 date = parse_date(m.group(1), ref_year)
                 description = m.group(2).strip()
-                amount = parse_amount(m.group(3))
+                amount = parse_amount(m.group(4))  # group(4) = amount
+                txn_type = "credit" if m.group(3) else "debit"  # group(3) = '+' or None
                 if date and amount and amount > 0 and len(description) > 2:
                     records.append({
                         "date": date,
                         "description": description,
                         "amount": amount,
-                        "type": detect_debit_credit(description, description),
+                        "type": txn_type,
                         "card_last4": card_last4,
                         "balance": None,
                     })

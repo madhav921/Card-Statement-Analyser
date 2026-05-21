@@ -100,9 +100,10 @@ def _launch_dashboard():
             file=sys.stderr,
         )
         sys.exit(1)
-    dashboard_module = "stmtforge.dashboard.app"
-    subprocess.run([sys.executable, "-m", "streamlit", "run",
-                    "-m", dashboard_module], check=False)
+    from pathlib import Path
+    import stmtforge.dashboard.app as _app_module
+    app_path = str(Path(_app_module.__file__))
+    subprocess.run([sys.executable, "-m", "streamlit", "run", app_path], check=False)
 
 
 def _init_project():
