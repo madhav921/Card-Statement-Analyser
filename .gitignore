@@ -41,7 +41,6 @@ Thumbs.db
 _local_reference/
 
 local/
-tests/
 social_posts/
 
 # Build / migration artifacts
