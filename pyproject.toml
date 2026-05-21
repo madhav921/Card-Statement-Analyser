@@ -7,7 +7,7 @@ name = "stmtforge"
 version = "0.1.2"
 description = "Parse credit card PDF statements from Indian banks (HDFC, ICICI, SBI, Axis, Kotak + 4 more) into structured data. Offline, privacy-first, with Streamlit dashboard."
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [
     {name = "Madhav", email = "madhav921@users.noreply.github.com"},

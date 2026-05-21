@@ -55,6 +55,7 @@ scripts/verify_csb.py
 # Temp files
 temp_*.log
 temp_*.txt
+build_output.txt
 
 # Local diagnostic / debug scripts in project root or scripts/
 diag*.py
